@@ -3,13 +3,12 @@ const ALGO_NAME = "BullwhipBreaker";
 const VERSION = "v1.0.0";
 
 const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
-
-// Tunable constants (deterministic)
-const PIPELINE_WEEKS = 2;
-const SAFETY_STOCK = 8;
-const EWMA_LAMBDA = 0.40;
-const ORDER_SMOOTH_BETA = 0.55;
-const MAX_ORDER = 500;
+const ROLE_PARAMS = {
+    retailer:   { L: 2, safety: 6,  lambda: 0.35, k: 0.55, beta: 0.45, up: 60,  down: 60,  max: 250 },
+    wholesaler: { L: 2, safety: 5,  lambda: 0.35, k: 0.45, beta: 0.55, up: 50,  down: 50,  max: 220 },
+    distributor:{ L: 2, safety: 4,  lambda: 0.35, k: 0.35, beta: 0.65, up: 40,  down: 40,  max: 200 },
+    factory:    { L: 2, safety: 3,  lambda: 0.35, k: 0.28, beta: 0.70, up: 30,  down: 30,  max: 180 }
+};
 
 function asInt(v) {
     if (v === null || v === undefined) return 0;
@@ -53,9 +52,28 @@ function getPrevOrder(weekObj, role) {
     return Math.max(0, asInt(orders[role]));
 }
 
+function clamp(n, lo, hi) {
+    return Math.max(lo, Math.min(hi, n));
+}
+
+function estimateOnOrder(weeks, role, L) {
+    // Sum over last L weeks: orders - arriving_shipments
+    const start = Math.max(0, weeks.length - L);
+    let onOrder = 0;
+    for (let i = start; i < weeks.length; i++) {
+        const w = weeks[i];
+        const rs = getRoleState(w, role);
+        const o = getPrevOrder(w, role);
+        onOrder += (o - rs.arriving_shipments);
+    }
+    return Math.max(0, onOrder);
+}
+
 function decideForRole(role, weeks) {
+    const p = ROLE_PARAMS[role] || ROLE_PARAMS.retailer;
     if (!weeks || weeks.length === 0) return 10;
 
+    // histories
     const incomingHist = [];
     const prevOrders = [];
 
@@ -67,25 +85,37 @@ function decideForRole(role, weeks) {
 
     const lastWeek = weeks[weeks.length - 1];
     const last = getRoleState(lastWeek, role);
-
-    const forecast = ewma(incomingHist, EWMA_LAMBDA);
-
-    // inventory position approximation: inventory - backlog + arriving_shipments
-    const invPos = Math.max(0, last.inventory - last.backlog + last.arriving_shipments);
-
-    // target position: cover (pipeline+1) weeks + safety buffer
-    const target = Math.max(0, Math.round(forecast * (PIPELINE_WEEKS + 1) + SAFETY_STOCK));
-
-    let rawOrder = target - invPos;
-    if (rawOrder < 0) rawOrder = 0;
-
-    // small deterministic backlog nudge
-    rawOrder += Math.round(0.15 * last.backlog);
-
     const lastOrder = prevOrders[prevOrders.length - 1] || 0;
-    const smoothed = Math.round((1 - ORDER_SMOOTH_BETA) * rawOrder + ORDER_SMOOTH_BETA * lastOrder);
 
-    return clampNonNegInt(smoothed);
+    // Forecast demand with EWMA
+    const forecast = ewma(incomingHist, p.lambda);
+
+    // Estimate pipeline/on-order
+    const onOrder = estimateOnOrder(weeks, role, p.L);
+
+    // Inventory position
+    const invPos = Math.max(0, last.inventory - last.backlog + onOrder);
+
+    // Target base-stock: cover (L+1) weeks + safety
+    const target = Math.max(0, Math.round(forecast * (p.L + 1) + p.safety));
+
+    // Error and damped correction
+    const error = target - invPos;
+
+    // Controller: lastOrder + k * error
+    let order = Math.round(lastOrder + p.k * error);
+
+    // Extra smoothing toward last order (optional damping)
+    order = Math.round((1 - p.beta) * order + p.beta * lastOrder);
+
+    // Rate limit (prevents spikes / bullwhip)
+    order = clamp(order, lastOrder - p.down, lastOrder + p.up);
+
+    // Non-negative and role max cap
+    order = Math.max(0, order);
+    order = Math.min(order, p.max);
+
+    return order;
 }
 
 module.exports = async (req, res) => {
