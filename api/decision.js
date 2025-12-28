@@ -1,13 +1,13 @@
 const STUDENT_EMAIL = "siveri@taltech.ee";
 const ALGO_NAME = "BullwhipBreaker";
-const VERSION = "v1.0.4";
+const VERSION = "v1.0.5";
 
 const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
 const ROLE_PARAMS = {
-    retailer:    { lead: 2, safety: 2, lambda: 0.50, stepUp: 35, stepDown: 70, max: 200, bGain: 0.18 },
-    wholesaler:  { lead: 2, safety: 2, lambda: 0.45, stepUp: 28, stepDown: 60, max: 170, bGain: 0.14 },
-    distributor: { lead: 2, safety: 1, lambda: 0.40, stepUp: 22, stepDown: 55, max: 150, bGain: 0.10 },
-    factory:     { lead: 2, safety: 1, lambda: 0.35, stepUp: 18, stepDown: 50, max: 130, bGain: 0.08 }
+    retailer:    { lead: 2, safetyWeeks: 1.0, safetyUnits: 2, lambda: 0.55, a: 0.35, b: 0.20, up: 30, down: 60, max: 120 },
+    wholesaler:  { lead: 2, safetyWeeks: 0.9, safetyUnits: 2, lambda: 0.50, a: 0.28, b: 0.18, up: 24, down: 55, max: 110 },
+    distributor: { lead: 2, safetyWeeks: 0.8, safetyUnits: 1, lambda: 0.45, a: 0.22, b: 0.16, up: 20, down: 50, max: 100 },
+    factory:     { lead: 2, safetyWeeks: 0.7, safetyUnits: 1, lambda: 0.40, a: 0.18, b: 0.14, up: 16, down: 45, max: 90  }
 };
 
 function asInt(v) {
@@ -49,62 +49,65 @@ function getPrevOrder(weekObj, role) {
     return Math.max(0, asInt(orders[role]));
 }
 
-function estimateOnOrderWindowed(weeks, role, window) {
+/**
+ * Pipeline estimate: outstanding orders not yet received.
+ * Use a window to avoid history drift, and clamp to >=0 for stability.
+ */
+function estimatePipeline(weeks, role, window) {
     const start = Math.max(0, weeks.length - window);
-    let onOrder = 0;
+    let pipe = 0;
     for (let i = start; i < weeks.length; i++) {
         const w = weeks[i];
-        const rs = getRoleState(w, role);
         const o = getPrevOrder(w, role);
-        onOrder += (o - rs.arriving_shipments);
+        const rs = getRoleState(w, role);
+        pipe += (o - rs.arriving_shipments);
     }
-    return onOrder;
+    // pipeline cannot be negative in reality; clamp to 0 to avoid weirdness
+    return Math.max(0, pipe);
 }
 
-function decideForRole(role, weeks) {
+/**
+ * Global demand signal (GlassBox-friendly):
+ * Use retailer incoming_orders history as "true customer demand"
+ * and feed the same forecast upstream to reduce bullwhip.
+ */
+function getGlobalDemandHistory(weeks) {
+    const hist = [];
+    for (const w of weeks) {
+        const r = getRoleState(w, "retailer");
+        hist.push(r.incoming_orders);
+    }
+    return hist;
+}
+
+function decideForRole(role, weeks, globalForecast) {
     const p = ROLE_PARAMS[role] || ROLE_PARAMS.retailer;
     if (!weeks || weeks.length === 0) return 10;
 
-    const incomingHist = [];
-    const prevOrders = [];
-
-    for (const w of weeks) {
-        const rs = getRoleState(w, role);
-        incomingHist.push(rs.incoming_orders);
-        prevOrders.push(getPrevOrder(w, role));
-    }
-
     const lastWeek = weeks[weeks.length - 1];
     const last = getRoleState(lastWeek, role);
-    const lastOrder = prevOrders[prevOrders.length - 1] || 0;
+    const lastOrder = getPrevOrder(lastWeek, role);
 
-    // Demand forecast
-    const forecast = ewma(incomingHist, p.lambda);
+    // Forecast demand: use global forecast for all roles (damps bullwhip)
+    const forecast = globalForecast;
 
-    // Pipeline
-    const onOrder = estimateOnOrderWindowed(weeks, role, p.lead + 2);
+    // Desired levels
+    const desiredInv = Math.round(forecast * p.safetyWeeks + p.safetyUnits);
+    const desiredPipe = Math.round(forecast * p.lead);
 
-    // Inventory position (can be negative)
-    const invPos = (last.inventory - last.backlog) + onOrder;
+    // Current levels
+    const netInv = last.inventory - last.backlog; // can be negative
+    const pipeline = estimatePipeline(weeks, role, p.lead + 2);
 
-    // Base-stock target
-    const target = Math.round(forecast * (p.lead + 1) + p.safety);
+    // Sterman adjustments
+    const invAdj = p.a * (desiredInv - netInv);
+    const pipeAdj = p.b * (desiredPipe - pipeline);
 
-    // Base order-up-to
-    let desired = Math.round(target - invPos);
-    if (desired < 0) desired = 0;
+    let desiredOrder = Math.round(forecast + invAdj + pipeAdj);
+    if (desiredOrder < 0) desiredOrder = 0;
 
-    // Small backlog correction (controlled): if backlog is big, add a fraction of it, but not too much..
-    const backlogKick = Math.round(clamp(last.backlog, 0, 200) * p.bGain);
-    desired = desired + backlogKick;
-
-    const excess = invPos - target;
-    const excessThreshold = Math.max(10, Math.round(forecast)); // ~1 week demand
-    if (excess > excessThreshold) {
-        desired = 0;
-    }
-
-    let order = clamp(desired, lastOrder - p.stepDown, lastOrder + p.stepUp);
+    // Rate limiting: allow faster downward correction to avoid inventory piles
+    let order = clamp(desiredOrder, lastOrder - p.down, lastOrder + p.up);
 
     order = Math.max(0, Math.min(order, p.max));
     return order;
@@ -134,16 +137,20 @@ module.exports = async (req, res) => {
             message: "BeerBot ready",
             uses_llm: false,
             llm_description: "deterministic heuristics",
-            student_comment: "EWMA + base-stock + small backlog kick + anti-hoarding + asymmetric rate limits"
+            student_comment: "Sterman anchor&adjust + pipeline control + shared demand forecast to reduce bullwhip"
         });
         return;
     }
 
-    // Weekly decision
     const weeks = Array.isArray(body.weeks) ? body.weeks : [];
+
+    // Global forecast from retailer incoming orders
+    const demandHist = getGlobalDemandHistory(weeks);
+    const globalForecast = ewma(demandHist, ROLE_PARAMS.retailer.lambda);
+
     const orders = {};
     for (const role of ROLES) {
-        orders[role] = decideForRole(role, weeks);
+        orders[role] = decideForRole(role, weeks, globalForecast);
     }
 
     res.status(200).json({ orders });
