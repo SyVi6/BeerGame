@@ -1,14 +1,13 @@
 const STUDENT_EMAIL = "siveri@taltech.ee";
 const ALGO_NAME = "BullwhipBreaker";
-const VERSION = "v1.0.3";
+const VERSION = "v1.0.4";
 
 const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
-
 const ROLE_PARAMS = {
-    retailer:    { lead: 2, baseSafety: 3, lambda: 0.45, maxStepUp: 45, maxStepDown: 55, max: 220 },
-    wholesaler:  { lead: 2, baseSafety: 3, lambda: 0.40, maxStepUp: 35, maxStepDown: 50, max: 180 },
-    distributor: { lead: 2, baseSafety: 2, lambda: 0.35, maxStepUp: 30, maxStepDown: 45, max: 160 },
-    factory:     { lead: 2, baseSafety: 2, lambda: 0.30, maxStepUp: 25, maxStepDown: 40, max: 140 }
+    retailer:    { lead: 2, safety: 2, lambda: 0.50, stepUp: 35, stepDown: 70, max: 200, bGain: 0.18 },
+    wholesaler:  { lead: 2, safety: 2, lambda: 0.45, stepUp: 28, stepDown: 60, max: 170, bGain: 0.14 },
+    distributor: { lead: 2, safety: 1, lambda: 0.40, stepUp: 22, stepDown: 55, max: 150, bGain: 0.10 },
+    factory:     { lead: 2, safety: 1, lambda: 0.35, stepUp: 18, stepDown: 50, max: 130, bGain: 0.08 }
 };
 
 function asInt(v) {
@@ -62,13 +61,6 @@ function estimateOnOrderWindowed(weeks, role, window) {
     return onOrder;
 }
 
-function backlogTrend(weeks, role) {
-    if (!weeks || weeks.length < 2) return 0;
-    const a = getRoleState(weeks[weeks.length - 2], role).backlog;
-    const b = getRoleState(weeks[weeks.length - 1], role).backlog;
-    return b - a;
-}
-
 function decideForRole(role, weeks) {
     const p = ROLE_PARAMS[role] || ROLE_PARAMS.retailer;
     if (!weeks || weeks.length === 0) return 10;
@@ -86,48 +78,39 @@ function decideForRole(role, weeks) {
     const last = getRoleState(lastWeek, role);
     const lastOrder = prevOrders[prevOrders.length - 1] || 0;
 
-    // Forecast demand (EWMA)
+    // Demand forecast
     const forecast = ewma(incomingHist, p.lambda);
 
-    // Better pipeline estimate: windowed
-    const window = p.lead + 2; // small, stable window
-    const onOrder = estimateOnOrderWindowed(weeks, role, window);
+    // Pipeline
+    const onOrder = estimateOnOrderWindowed(weeks, role, p.lead + 2);
 
-    // Inventory position (CAN be negative)
+    // Inventory position (can be negative)
     const invPos = (last.inventory - last.backlog) + onOrder;
 
-    // Adaptive safety: if backlog exists or is rising, increase safety temporarily.
-    // Keeps inventory low when things are fine, but fights persistent backlog.
-    const bTrend = backlogTrend(weeks, role);
-    const safetyBoost =
-        Math.ceil(last.backlog / 25) +            // +1 per ~25 backlog
-        (bTrend > 0 ? 1 : 0);                     // +1 if backlog is increasing
+    // Base-stock target
+    const target = Math.round(forecast * (p.lead + 1) + p.safety);
 
-    const safety = p.baseSafety + clamp(safetyBoost, 0, 6);
-
-    // Target base-stock
-    const target = Math.round(forecast * (p.lead + 1) + safety);
-
-    // Core order-up-to
+    // Base order-up-to
     let desired = Math.round(target - invPos);
     if (desired < 0) desired = 0;
 
-    // If backlog is high, allow faster ramp-up to catch up.
-    // If backlog is zero, keep it smooth to avoid bullwhip.
-    const extraUp = clamp(Math.ceil(last.backlog / 15), 0, 30); // up to +30 extra step
-    const stepUp = p.maxStepUp + extraUp;
-    const stepDown = p.maxStepDown;
+    // Small backlog correction (controlled): if backlog is big, add a fraction of it, but not too much..
+    const backlogKick = Math.round(clamp(last.backlog, 0, 200) * p.bGain);
+    desired = desired + backlogKick;
 
-    let order = clamp(desired, lastOrder - stepDown, lastOrder + stepUp);
+    const excess = invPos - target;
+    const excessThreshold = Math.max(10, Math.round(forecast)); // ~1 week demand
+    if (excess > excessThreshold) {
+        desired = 0;
+    }
 
-    // Cap avoidance
-    order = Math.min(order, p.max);
+    let order = clamp(desired, lastOrder - p.stepDown, lastOrder + p.stepUp);
 
+    order = Math.max(0, Math.min(order, p.max));
     return order;
 }
 
 module.exports = async (req, res) => {
-    // Health check / compatibility
     if (req.method === "GET") {
         res.status(200).json({ ok: true, message: "BeerBot online. Use POST /api/decision" });
         return;
@@ -151,7 +134,7 @@ module.exports = async (req, res) => {
             message: "BeerBot ready",
             uses_llm: false,
             llm_description: "deterministic heuristics",
-            student_comment: "EWMA forecast + base-stock with adaptive safety + windowed pipeline + adaptive ramp-up"
+            student_comment: "EWMA + base-stock + small backlog kick + anti-hoarding + asymmetric rate limits"
         });
         return;
     }
