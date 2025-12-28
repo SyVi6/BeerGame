@@ -114,6 +114,11 @@ function decideForRole(role, weeks) {
 }
 
 module.exports = async (req, res) => {
+    if (req.method === "GET") {
+        res.status(200).json({ ok: true, message: "BeerBot online. Use POST /api/decision" });
+        return;
+    }
+
     if (req.method !== "POST") {
         res.status(405).json({ ok: false, message: "Method Not Allowed" });
         return;
