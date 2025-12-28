@@ -1,13 +1,15 @@
 const STUDENT_EMAIL = "siveri@taltech.ee";
 const ALGO_NAME = "BullwhipBreaker";
-const VERSION = "v1.0.0";
+const VERSION = "v1.0.2";
 
 const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
+
+// lead = assumed effective lead time (weeks) in the game
 const ROLE_PARAMS = {
-    retailer:   { L: 2, safety: 6,  lambda: 0.35, k: 0.55, beta: 0.45, up: 60,  down: 60,  max: 250 },
-    wholesaler: { L: 2, safety: 5,  lambda: 0.35, k: 0.45, beta: 0.55, up: 50,  down: 50,  max: 220 },
-    distributor:{ L: 2, safety: 4,  lambda: 0.35, k: 0.35, beta: 0.65, up: 40,  down: 40,  max: 200 },
-    factory:    { L: 2, safety: 3,  lambda: 0.35, k: 0.28, beta: 0.70, up: 30,  down: 30,  max: 180 }
+    retailer:    { lead: 2, safety: 2, lambda: 0.45, maxStepUp: 40, maxStepDown: 60, max: 200 },
+    wholesaler:  { lead: 2, safety: 2, lambda: 0.40, maxStepUp: 30, maxStepDown: 50, max: 160 },
+    distributor: { lead: 2, safety: 1, lambda: 0.35, maxStepUp: 25, maxStepDown: 45, max: 140 },
+    factory:     { lead: 2, safety: 1, lambda: 0.30, maxStepUp: 20, maxStepDown: 40, max: 120 }
 };
 
 function asInt(v) {
@@ -20,11 +22,8 @@ function asInt(v) {
     return 0;
 }
 
-function clampNonNegInt(n) {
-    n = asInt(n);
-    if (n < 0) return 0;
-    if (n > MAX_ORDER) return MAX_ORDER;
-    return n;
+function clamp(n, lo, hi) {
+    return Math.max(lo, Math.min(hi, n));
 }
 
 function ewma(values, lambda) {
@@ -52,28 +51,23 @@ function getPrevOrder(weekObj, role) {
     return Math.max(0, asInt(orders[role]));
 }
 
-function clamp(n, lo, hi) {
-    return Math.max(lo, Math.min(hi, n));
-}
-
-function estimateOnOrder(weeks, role, L) {
-    // Sum over last L weeks: orders - arriving_shipments
-    const start = Math.max(0, weeks.length - L);
+function estimateOnOrderCumulative(weeks, role) {
+    // Approximate outstanding pipeline units:
+    // onOrder = Σ(orders - arriving_shipments) over all observed history
+    // Do NOT clamp to 0 here; small negatives can happen due to timing, and invPos will handle it.
     let onOrder = 0;
-    for (let i = start; i < weeks.length; i++) {
-        const w = weeks[i];
+    for (const w of weeks) {
         const rs = getRoleState(w, role);
         const o = getPrevOrder(w, role);
         onOrder += (o - rs.arriving_shipments);
     }
-    return Math.max(0, onOrder);
+    return onOrder;
 }
 
 function decideForRole(role, weeks) {
     const p = ROLE_PARAMS[role] || ROLE_PARAMS.retailer;
     if (!weeks || weeks.length === 0) return 10;
 
-    // histories
     const incomingHist = [];
     const prevOrders = [];
 
@@ -87,31 +81,32 @@ function decideForRole(role, weeks) {
     const last = getRoleState(lastWeek, role);
     const lastOrder = prevOrders[prevOrders.length - 1] || 0;
 
-    // Forecast demand with EWMA
+    // Forecast demand (EWMA)
     const forecast = ewma(incomingHist, p.lambda);
 
-    // Estimate pipeline/on-order
-    const onOrder = estimateOnOrder(weeks, role, p.L);
+    // Pipeline estimate
+    const onOrder = estimateOnOrderCumulative(weeks, role);
 
-    // Inventory position
-    const invPos = Math.max(0, last.inventory - last.backlog + onOrder);
+    // Inventory position (CAN be negative!)
+    // inventory - backlog + onOrder
+    const invPos = (last.inventory - last.backlog) + onOrder;
 
-    // Target base-stock: cover (L+1) weeks + safety
-    const target = Math.max(0, Math.round(forecast * (p.L + 1) + p.safety));
+    // Base-stock target: cover (lead + 1) weeks + safety
+    const target = Math.round(forecast * (p.lead + 1) + p.safety);
 
-    // Error and damped correction
-    const error = target - invPos;
+    // Order-up-to
+    let order = Math.round(target - invPos);
+    if (order < 0) order = 0;
 
-    // Controller: lastOrder + k * error
-    let order = Math.round(lastOrder + p.k * error);
+    // Anti-bullwhip: limit changes from previous order
+    order = clamp(order, lastOrder - p.maxStepDown, lastOrder + p.maxStepUp);
 
-    // Extra smoothing toward last order (optional damping)
-    order = Math.round((1 - p.beta) * order + p.beta * lastOrder);
+    // Cap avoidance: soften near max (prevents hitting caps and creating plateaus)
+    if (order > 0.85 * p.max) {
+        order = Math.round(0.85 * p.max);
+    }
 
-    // Rate limit (prevents spikes / bullwhip)
-    order = clamp(order, lastOrder - p.down, lastOrder + p.up);
-
-    // Non-negative and role max cap
+    // Final clamps
     order = Math.max(0, order);
     order = Math.min(order, p.max);
 
@@ -137,7 +132,7 @@ module.exports = async (req, res) => {
             message: "BeerBot ready",
             uses_llm: false,
             llm_description: "offline tuning / deterministic heuristics",
-            student_comment: "Deterministic order-up-to + smoothing controller"
+            student_comment: "Deterministic EWMA + base-stock + inventory-position control with rate limiting"
         });
         return;
     }
