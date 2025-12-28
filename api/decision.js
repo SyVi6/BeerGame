@@ -1,15 +1,14 @@
 const STUDENT_EMAIL = "siveri@taltech.ee";
 const ALGO_NAME = "BullwhipBreaker";
-const VERSION = "v1.0.2";
+const VERSION = "v1.0.3";
 
 const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
 
-// lead = assumed effective lead time (weeks) in the game
 const ROLE_PARAMS = {
-    retailer:    { lead: 2, safety: 2, lambda: 0.45, maxStepUp: 40, maxStepDown: 60, max: 200 },
-    wholesaler:  { lead: 2, safety: 2, lambda: 0.40, maxStepUp: 30, maxStepDown: 50, max: 160 },
-    distributor: { lead: 2, safety: 1, lambda: 0.35, maxStepUp: 25, maxStepDown: 45, max: 140 },
-    factory:     { lead: 2, safety: 1, lambda: 0.30, maxStepUp: 20, maxStepDown: 40, max: 120 }
+    retailer:    { lead: 2, baseSafety: 3, lambda: 0.45, maxStepUp: 45, maxStepDown: 55, max: 220 },
+    wholesaler:  { lead: 2, baseSafety: 3, lambda: 0.40, maxStepUp: 35, maxStepDown: 50, max: 180 },
+    distributor: { lead: 2, baseSafety: 2, lambda: 0.35, maxStepUp: 30, maxStepDown: 45, max: 160 },
+    factory:     { lead: 2, baseSafety: 2, lambda: 0.30, maxStepUp: 25, maxStepDown: 40, max: 140 }
 };
 
 function asInt(v) {
@@ -51,17 +50,23 @@ function getPrevOrder(weekObj, role) {
     return Math.max(0, asInt(orders[role]));
 }
 
-function estimateOnOrderCumulative(weeks, role) {
-    // Approximate outstanding pipeline units:
-    // onOrder = Σ(orders - arriving_shipments) over all observed history
-    // Do NOT clamp to 0 here; small negatives can happen due to timing, and invPos will handle it.
+function estimateOnOrderWindowed(weeks, role, window) {
+    const start = Math.max(0, weeks.length - window);
     let onOrder = 0;
-    for (const w of weeks) {
+    for (let i = start; i < weeks.length; i++) {
+        const w = weeks[i];
         const rs = getRoleState(w, role);
         const o = getPrevOrder(w, role);
         onOrder += (o - rs.arriving_shipments);
     }
     return onOrder;
+}
+
+function backlogTrend(weeks, role) {
+    if (!weeks || weeks.length < 2) return 0;
+    const a = getRoleState(weeks[weeks.length - 2], role).backlog;
+    const b = getRoleState(weeks[weeks.length - 1], role).backlog;
+    return b - a;
 }
 
 function decideForRole(role, weeks) {
@@ -84,36 +89,45 @@ function decideForRole(role, weeks) {
     // Forecast demand (EWMA)
     const forecast = ewma(incomingHist, p.lambda);
 
-    // Pipeline estimate
-    const onOrder = estimateOnOrderCumulative(weeks, role);
+    // Better pipeline estimate: windowed
+    const window = p.lead + 2; // small, stable window
+    const onOrder = estimateOnOrderWindowed(weeks, role, window);
 
-    // Inventory position (CAN be negative!)
-    // inventory - backlog + onOrder
+    // Inventory position (CAN be negative)
     const invPos = (last.inventory - last.backlog) + onOrder;
 
-    // Base-stock target: cover (lead + 1) weeks + safety
-    const target = Math.round(forecast * (p.lead + 1) + p.safety);
+    // Adaptive safety: if backlog exists or is rising, increase safety temporarily.
+    // Keeps inventory low when things are fine, but fights persistent backlog.
+    const bTrend = backlogTrend(weeks, role);
+    const safetyBoost =
+        Math.ceil(last.backlog / 25) +            // +1 per ~25 backlog
+        (bTrend > 0 ? 1 : 0);                     // +1 if backlog is increasing
 
-    // Order-up-to
-    let order = Math.round(target - invPos);
-    if (order < 0) order = 0;
+    const safety = p.baseSafety + clamp(safetyBoost, 0, 6);
 
-    // Anti-bullwhip: limit changes from previous order
-    order = clamp(order, lastOrder - p.maxStepDown, lastOrder + p.maxStepUp);
+    // Target base-stock
+    const target = Math.round(forecast * (p.lead + 1) + safety);
 
-    // Cap avoidance: soften near max (prevents hitting caps and creating plateaus)
-    if (order > 0.85 * p.max) {
-        order = Math.round(0.85 * p.max);
-    }
+    // Core order-up-to
+    let desired = Math.round(target - invPos);
+    if (desired < 0) desired = 0;
 
-    // Final clamps
-    order = Math.max(0, order);
+    // If backlog is high, allow faster ramp-up to catch up.
+    // If backlog is zero, keep it smooth to avoid bullwhip.
+    const extraUp = clamp(Math.ceil(last.backlog / 15), 0, 30); // up to +30 extra step
+    const stepUp = p.maxStepUp + extraUp;
+    const stepDown = p.maxStepDown;
+
+    let order = clamp(desired, lastOrder - stepDown, lastOrder + stepUp);
+
+    // Cap avoidance
     order = Math.min(order, p.max);
 
     return order;
 }
 
 module.exports = async (req, res) => {
+    // Health check / compatibility
     if (req.method === "GET") {
         res.status(200).json({ ok: true, message: "BeerBot online. Use POST /api/decision" });
         return;
@@ -136,8 +150,8 @@ module.exports = async (req, res) => {
             supports: { blackbox: true, glassbox: true },
             message: "BeerBot ready",
             uses_llm: false,
-            llm_description: "offline tuning / deterministic heuristics",
-            student_comment: "Deterministic EWMA + base-stock + inventory-position control with rate limiting"
+            llm_description: "deterministic heuristics",
+            student_comment: "EWMA forecast + base-stock with adaptive safety + windowed pipeline + adaptive ramp-up"
         });
         return;
     }
