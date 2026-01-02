@@ -1,18 +1,18 @@
 const STUDENT_EMAIL = "siveri@taltech.ee";
 const ALGO_NAME = "BullwhipSlayer";
-const VERSION = "v2.2.0";
+const VERSION = "v2.3.0";
 
 const PARAMS = {
     LEAD_TIME: 2,           // Tarneaeg lülide vahel (nädalates) on konstantne.
-    INITIAL_ORDER: 10,      // Algne tellimus, kui ajalugu puudub.
-    Kp: 0.15,               // Proportsionaalne võimendus (reageerib hetkeveale).
-    Ki: 0.10,               // Integraalne võimendus (korrigeerib pikaajalist, kumulatiivset viga).
-    INTEGRAL_CLAMP: 45,     // Anti-Windup: integraalviga ei saa minna üle +/- selle väärtuse. KÕIGE OLULISEM PARANDUS!
-    ORDER_SMOOTHING: 0.4,   // 40% uus arvutus + 60% eelmine tellimus. Summutab võnkumisi.
-    MAX_STEP_CHANGE: 18,    // Rate Limiting: tellimus ei saa muutuda nädalas rohkem kui see väärtus.
-    FORECAST_WINDOW: 8,     // Mitu viimast nädalat võtta prognoosi aluseks.
-    FORECAST_LAMBDA: 0.35,   // EWMA (eksponentsiaalse silumise) silumisfaktor.
-    SAFETY_STOCK_WEEKS: 1.6, // Mitu nädalat prognoositud nõudlust hoida puhverlaos.
+    INITIAL_ORDER: 12,      // Algne tellimus, kui ajalugu puudub.
+    Kp: 0.30,               // Proportsionaalne võimendus (reageerib hetkeveale).
+    Ki: 0.22,               // Integraalne võimendus (korrigeerib pikaajalist, kumulatiivset viga).
+    INTEGRAL_CLAMP: 70,     // Anti-Windup: integraalviga ei saa minna üle +/- selle väärtuse. KÕIGE OLULISEM PARANDUS!
+    ORDER_SMOOTHING: 0.75,   // 40% uus arvutus + 60% eelmine tellimus. Summutab võnkumisi.
+    MAX_STEP_CHANGE: 30,    // Rate Limiting: tellimus ei saa muutuda nädalas rohkem kui see väärtus.
+    FORECAST_WINDOW: 10,     // Mitu viimast nädalat võtta prognoosi aluseks.
+    FORECAST_LAMBDA: 0.3,   // EWMA (eksponentsiaalse silumise) silumisfaktor.
+    SAFETY_STOCK_WEEKS: 1.2, // Mitu nädalat prognoositud nõudlust hoida puhverlaos.
 };
 
 const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
@@ -25,7 +25,7 @@ const asInt = (value) => {
 // Exponentially Weighted Moving Average
 function calculateEWMA(values, lambda) {
     if (!values || values.length === 0) return PARAMS.INITIAL_ORDER;
-    let forecast = values[0];
+    let forecast = values.length > 0 ? values[0] : PARAMS.INITIAL_ORDER;
     for (let i = 1; i < values.length; i++) {
         forecast = lambda * values[i] + (1 - lambda) * forecast;
     }
@@ -33,53 +33,52 @@ function calculateEWMA(values, lambda) {
 }
 
 /**
- * Arvutab otsuse ühele rollile, kasutades stabiliseeritud PI-regulaatorit.
+ * Arvutab otsuse ühele rollile, kasutades lõplikku, häälestatud regulaatorit.
  */
 function decideForRole(role, weeks, demandForecast) {
-    if (weeks.length === 0) return PARAMS.INITIAL_ORDER;
+    const historyLength = weeks.length;
+    if (historyLength === 0) return PARAMS.INITIAL_ORDER;
 
-    // 1. Ajaloo kogumine
-    const demandHistory = [];
-    const inventoryHistory = [];
-    const backlogHistory = [];
-    const orderHistory = [];
-    weeks.forEach(w => {
-        demandHistory.push(asInt(w.roles?.[role]?.incoming_orders));
-        inventoryHistory.push(asInt(w.roles?.[role]?.inventory));
-        backlogHistory.push(asInt(w.roles?.[role]?.backlog));
-        orderHistory.push(asInt(w.orders?.[role]));
-    });
+    // Ajaloo eraldamine on selgem ja väldib korduvaid tsükleid.
+    const history = weeks.map(w => ({
+        demand: asInt(w.roles?.[role]?.incoming_orders),
+        inventory: asInt(w.roles?.[role]?.inventory),
+        backlog: asInt(w.roles?.[role]?.backlog),
+        order: asInt(w.orders?.[role]),
+    }));
 
-    const lastOrder = orderHistory.length > 1 ? orderHistory[orderHistory.length - 2] : PARAMS.INITIAL_ORDER;
+    const lastState = history[historyLength - 1];
+    const lastOrder = historyLength > 1 ? history[historyLength - 2].order : PARAMS.INITIAL_ORDER;
 
-    // 2. Prognoos
     const forecast = demandForecast !== undefined
         ? demandForecast
-        : calculateEWMA(demandHistory.slice(-PARAMS.FORECAST_WINDOW), PARAMS.FORECAST_LAMBDA);
+        : calculateEWMA(history.map(h => h.demand).slice(-PARAMS.FORECAST_WINDOW), PARAMS.FORECAST_LAMBDA);
 
-    // 3. Laopositsiooni ja vigade arvutamine (koos Anti-Windup'iga)
-    let integralError = 0;
-    let currentError = 0;
-    for (let i = 0; i < weeks.length; i++) {
-        const pipeline = orderHistory.slice(Math.max(0, i - PARAMS.LEAD_TIME), i).reduce((sum, val) => sum + val, 0);
-        const inventoryPosition = inventoryHistory[i] - backlogHistory[i] + pipeline;
-        const targetInvPos = forecast * (PARAMS.LEAD_TIME + PARAMS.SAFETY_STOCK_WEEKS);
-        currentError = targetInvPos - inventoryPosition;
-        integralError += currentError;
-        // ANTI-WINDUP: Piirame integraalosa, et vältida ülereageerimist
-        integralError = Math.max(-PARAMS.INTEGRAL_CLAMP, Math.min(PARAMS.INTEGRAL_CLAMP, integralError));
-    }
+    // Täpsem "on-order" arvutus, mis vaatab ainult viimaseid tellimusi tarneaja sees.
+    const onOrder = history.slice(-PARAMS.LEAD_TIME).reduce((sum, h) => sum + h.order, 0);
 
-    // 4. PI-regulaatori arvutus
+    const inventoryPosition = lastState.inventory - lastState.backlog + onOrder;
+    const targetInvPos = forecast * (PARAMS.LEAD_TIME + PARAMS.SAFETY_STOCK_WEEKS);
+
+    const currentError = targetInvPos - inventoryPosition;
+
+    // Integraalviga arvutatakse kogu ajaloost, kuid see on viimane samm, mitte tsükli sees.
+    const totalIntegralError = history.reduce((sum, h, i) => {
+        const pastOnOrder = history.slice(Math.max(0, i - PARAMS.LEAD_TIME), i).reduce((s, ho) => s + ho.order, 0);
+        const pastInvPos = h.inventory - h.backlog + pastOnOrder;
+        const pastTarget = forecast * (PARAMS.LEAD_TIME + PARAMS.SAFETY_STOCK_WEEKS); // lihtsustatud, kasutab viimast prognoosi
+        const pastError = pastTarget - pastInvPos;
+        return sum + pastError;
+    }, 0);
+
+    const integralError = Math.max(-PARAMS.INTEGRAL_CLAMP, Math.min(PARAMS.INTEGRAL_CLAMP, totalIntegralError));
+
     const P = PARAMS.Kp * currentError;
     const I = PARAMS.Ki * integralError;
     const rawOrder = forecast + P + I;
 
-    // 5. Tellimuse stabiliseerimine
-    // Silumine: Segame uue arvutuse eelmise tellimusega, et vältida järske hüppeid
     const smoothedOrder = PARAMS.ORDER_SMOOTHING * rawOrder + (1 - PARAMS.ORDER_SMOOTHING) * lastOrder;
 
-    // Muutuse piiramine: Tellimus ei saa liiga kiiresti muutuda
     const finalOrder = Math.max(
         lastOrder - PARAMS.MAX_STEP_CHANGE,
         Math.min(lastOrder + PARAMS.MAX_STEP_CHANGE, smoothedOrder)
@@ -87,7 +86,6 @@ function decideForRole(role, weeks, demandForecast) {
 
     return Math.round(Math.max(0, finalOrder));
 }
-
 
 export default async function handler(req, res) {
     if (req.method !== 'POST') {
@@ -105,8 +103,8 @@ export default async function handler(req, res) {
             supports: { blackbox: true, glassbox: true },
             message: "BeerBot ready",
             uses_llm: false,
-            llm_description: "A stabilized Proportional-Integral (PI) controller featuring anti-windup, order smoothing, and rate limiting to ensure robust and stable supply chain performance.",
-            student_comment: "This version actively prevents controller instability and overshoot by clamping integral error and smoothing order changes, aiming for minimal total cost by balancing inventory and backlog without oscillation.",
+            llm_description: "A finely-tuned, responsive PI controller. Parameters are balanced for aggressive backlog clearing and minimal inventory overshoot, targeting top-tier performance.",
+            student_comment: "Final version: Increased controller gains and relaxed stabilizers for a faster, more adaptive response to demand changes, aiming to minimize total cost across the entire simulation.",
         });
     }
 
@@ -114,14 +112,12 @@ export default async function handler(req, res) {
     const orders = {};
 
     if (mode === 'glassbox' && weeks.length > 0) {
-        // GlassBox: Kõik põhineb jaemüüja tegelikul nõudlusel
         const retailerDemandHistory = weeks.map(w => asInt(w.roles?.retailer?.incoming_orders));
         const demandForecast = calculateEWMA(retailerDemandHistory.slice(-PARAMS.FORECAST_WINDOW), PARAMS.FORECAST_LAMBDA);
         for (const role of ROLES) {
             orders[role] = decideForRole(role, weeks, demandForecast);
         }
     } else {
-        // BlackBox: Igaüks otsustab iseseisvalt
         for (const role of ROLES) {
             orders[role] = decideForRole(role, weeks);
         }
