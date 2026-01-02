@@ -1,140 +1,108 @@
 const STUDENT_EMAIL = "siveri@taltech.ee";
-const ALGO_NAME = "BullwhipBreaker";
-const VERSION = "v1.0.8";
+const ALGO_NAME = "BullwhipSlayer";
+const VERSION = "v2.1.0";
 
-const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
-const ROLE_PARAMS = {
-    retailer:    { lead: 2, lambda: 0.35, safety: 1, Kp: 0.18, backlogFrac: 0.12, deadband: 6, stepUp: 10, stepDown: 14, max: 80 },
-    wholesaler:  { lead: 2, lambda: 0.30, safety: 1, Kp: 0.16, backlogFrac: 0.10, deadband: 7, stepUp: 9,  stepDown: 13, max: 80 },
-    distributor: { lead: 2, lambda: 0.28, safety: 1, Kp: 0.14, backlogFrac: 0.08, deadband: 8, stepUp: 8,  stepDown: 12, max: 80 },
-    factory:     { lead: 2, lambda: 0.25, safety: 1, Kp: 0.12, backlogFrac: 0.06, deadband: 9, stepUp: 7,  stepDown: 11, max: 80 },
+const PARAMS = {
+    LEAD_TIME: 2,           // Tarneaeg lülide vahel (nädalates) on konstantne.
+    INITIAL_ORDER: 12,      // Algne tellimus, kui ajalugu puudub.
+    Kp: 0.25,               // Proportsionaalne võimendus (reageerib hetkeveale).
+    Ki: 0.18,               // Integraalne võimendus (korrigeerib pikaajalist, kumulatiivset viga).
+    FORECAST_WINDOW: 8,     // Mitu viimast nädalat võtta prognoosi aluseks.
+    FORECAST_LAMBDA: 0.3,   // EWMA (eksponentsiaalse silumise) silumisfaktor.
+    SAFETY_STOCK_WEEKS: 1.8, // Mitu nädalat prognoositud nõudlust hoida puhverlaos.
 };
 
-function asInt(v) {
-    if (v === null || v === undefined) return 0;
-    if (typeof v === "number") return Math.round(v);
-    if (typeof v === "string") {
-        const n = parseInt(v.trim(), 10);
-        return Number.isFinite(n) ? n : 0;
-    }
-    return 0;
-}
+const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
 
-function clamp(n, lo, hi) {
-    return Math.max(lo, Math.min(hi, n));
-}
+const asInt = (value) => {
+    const num = parseInt(value, 10);
+    return isNaN(num) ? 0 : num;
+};
 
-function ewma(values, lambda) {
-    if (!values || values.length === 0) return 0;
-    let s = values[0];
+// Exponentially Weighted Moving Average
+function calculateEWMA(values, lambda) {
+    if (!values || values.length === 0) return PARAMS.INITIAL_ORDER;
+    let forecast = values.length > 0 ? values[0] : PARAMS.INITIAL_ORDER;
     for (let i = 1; i < values.length; i++) {
-        s = lambda * values[i] + (1 - lambda) * s;
+        forecast = lambda * values[i] + (1 - lambda) * forecast;
     }
-    return Math.max(0, s);
+    return Math.max(0, forecast);
 }
 
-function getRoleState(weekObj, role) {
-    const roles = weekObj?.roles || {};
-    const r = roles[role] || {};
-    return {
-        inventory: Math.max(0, asInt(r.inventory)),
-        backlog: Math.max(0, asInt(r.backlog)),
-        incoming_orders: Math.max(0, asInt(r.incoming_orders)),
-        arriving_shipments: Math.max(0, asInt(r.arriving_shipments)),
-    };
-}
+/**
+ * Eraldab ja struktureerib ühe rolli kohta käiva ajaloo.
+ */
+function getRoleHistory(weeks, role) {
+    const history = weeks.map(w => ({
+        inventory: asInt(w.roles?.[role]?.inventory),
+        backlog: asInt(w.roles?.[role]?.backlog),
+        incoming_orders: asInt(w.roles?.[role]?.incoming_orders),
+        previous_order: asInt(w.orders?.[role]),
+    }));
 
-function getPrevOrder(weekObj, role) {
-    const orders = weekObj?.orders || {};
-    return Math.max(0, asInt(orders[role]));
-}
+    // Arvutame iga nädala kohta laopositsiooni ja vea.
+    let integralError = 0;
+    const historyWithMetrics = [];
 
-function estimateOnOrderFinite(weeks, role, lead) {
-    const start = Math.max(0, weeks.length - lead);
-    let onOrder = 0;
-    for (let i = start; i < weeks.length; i++) {
-        const w = weeks[i];
-        const rs = getRoleState(w, role);
-        const o = getPrevOrder(w, role);
-        onOrder += (o - rs.arriving_shipments);
+    for (let i = 0; i < history.length; i++) {
+        const weekData = history[i];
+        const currentSlice = history.slice(0, i + 1);
+
+        // Torus olev kaup (pipeline) on viimase `LEAD_TIME` nädala jooksul tehtud tellimused.
+        const pipeline = currentSlice.slice(-PARAMS.LEAD_TIME).reduce((sum, h) => sum + h.previous_order, 0);
+        const inventoryPosition = weekData.inventory - weekData.backlog + pipeline;
+
+        // Sihttase baseerub prognoosil, mis on arvutatud kuni selle hetkeni.
+        const demandHistory = currentSlice.map(h => h.incoming_orders);
+        const forecast = calculateEWMA(demandHistory.slice(-PARAMS.FORECAST_WINDOW), PARAMS.FORECAST_LAMBDA);
+        const targetInventory = forecast * PARAMS.SAFETY_STOCK_WEEKS;
+
+        const error = targetInventory - inventoryPosition;
+        integralError += error;
+
+        historyWithMetrics.push({ ...weekData, inventoryPosition, error, integralError });
     }
-    return onOrder;
+    return historyWithMetrics;
 }
 
-function tail(arr, n) {
-    if (!arr || arr.length <= n) return arr || [];
-    return arr.slice(arr.length - n);
+/**
+ * Teeb otsuse ühele rollile, kasutades PI-regulaatori loogikat.
+ * @param {string} role - Roll, millele otsust tehakse.
+ * @param {Array} weeks - Kogu simulatsiooni ajalugu.
+ * @param {number} [demandForecast] - Vabatahtlik parameeter; kui see on antud (GlassBox), kasutatakse seda, muidu arvutatakse rolli enda ajaloost.
+ */
+function decideForRole(role, weeks, demandForecast) {
+    if (weeks.length === 0) return PARAMS.INITIAL_ORDER;
+
+    const history = getRoleHistory(weeks, role);
+    const last = history[history.length - 1];
+
+    // Prognoos
+    // BlackBox: igaüks prognoosib ise.
+    // GlassBox: kasutatakse etteantud jaemüüja prognoosi.
+    const forecast = demandForecast !== undefined
+        ? demandForecast
+        : calculateEWMA(history.map(h => h.incoming_orders).slice(-PARAMS.FORECAST_WINDOW), PARAMS.FORECAST_LAMBDA);
+
+    const P = PARAMS.Kp * last.error;
+    const I = PARAMS.Ki * last.integralError;
+
+    // Uus tellimus = prognoos + korrektsioonid.
+    const order = forecast + P + I;
+
+    return Math.round(Math.max(0, order));
 }
 
-function decideForRole(role, weeks) {
-    const p = ROLE_PARAMS[role] || ROLE_PARAMS.retailer;
-    if (!weeks || weeks.length === 0) return 10;
-
-    // histories
-    const incomingHist = [];
-    const orderHist = [];
-
-    for (const w of weeks) {
-        const rs = getRoleState(w, role);
-        incomingHist.push(rs.incoming_orders);
-        orderHist.push(getPrevOrder(w, role));
-    }
-
-    const lastWeek = weeks[weeks.length - 1];
-    const last = getRoleState(lastWeek, role);
-    const lastOrder = orderHist[orderHist.length - 1] || 0;
-
-    // 1) Forecast: EWMA viimase 8 nädala incoming_orders peal
-    const forecast = ewma(tail(incomingHist, 8), p.lambda);
-
-    // 2) Pipeline (finite, lead-based)
-    const onOrder = estimateOnOrderFinite(weeks, role, p.lead);
-
-    // 3) Inventory position: inv - backlog + pipeline
-    const invPos = (last.inventory - last.backlog) + onOrder;
-
-    // 4) Target invPos: cover lead+1 + safety (väike safety)
-    const targetInvPos = Math.round(forecast * (p.lead + 1) + p.safety);
-
-    const error = targetInvPos - invPos;
-    const backlogBleed = (last.backlog > 0)
-        ? Math.min(last.backlog, Math.round((last.backlog * p.backlogFrac) + (last.backlog / (p.lead + 1))))
-        : 0;
-
-    let orderRaw = forecast + p.Kp * error + backlogBleed;
-
-    // 7) Deadband: kui viga on väike, ära muuda (hoiab stabiilsust)
-    if (Math.abs(error) <= p.deadband) {
-        orderRaw = forecast;
-    }
-
-    let order = Math.round(0.65 * orderRaw + 0.35 * lastOrder);
-
-    // 9) Rate limit (anti-bullwhip)
-    order = clamp(order, lastOrder - p.stepDown, lastOrder + p.stepUp);
-
-    // 10) Bounds
-    order = Math.max(0, Math.min(p.max, order));
-
-    return order;
-}
-
-module.exports = async (req, res) => {
-    if (req.method === "GET") {
-        res.status(200).json({ ok: true, message: "BeerBot online. Use POST /api/decision" });
-        return;
-    }
-
-    if (req.method !== "POST") {
-        res.status(405).json({ ok: false, message: "Method Not Allowed" });
-        return;
+export default async function handler(req, res) {
+    if (req.method !== 'POST') {
+        return res.status(405).json({ ok: false, message: "Method Not Allowed" });
     }
 
     const body = req.body || {};
 
     // Handshake
     if (body.handshake === true) {
-        res.status(200).json({
+        return res.status(200).json({
             ok: true,
             student_email: STUDENT_EMAIL,
             algorithm_name: ALGO_NAME,
@@ -142,17 +110,28 @@ module.exports = async (req, res) => {
             supports: { blackbox: true, glassbox: true },
             message: "BeerBot ready",
             uses_llm: false,
-            llm_description: "Deterministic control heuristics (EWMA + inventory-position feedback + deadband + rate limiting)",
-            student_comment: "Stable-demand ordering with small inventory-position corrections and slow backlog bleed to reduce bullwhip.",
+            llm_description: "Deterministic PI controller with EWMA forecasting. GlassBox mode uses a coordinated strategy based on retailer demand to eliminate the bullwhip effect.",
+            student_comment: "A robust Proportional-Integral (PI) controller corrects long-term supply/demand mismatch, while the GlassBox strategy ensures system-wide stability by synchronizing all roles to the actual end-consumer demand.",
         });
-        return;
     }
 
-    const weeks = Array.isArray(body.weeks) ? body.weeks : [];
+    const { weeks = [], mode = 'blackbox' } = body;
     const orders = {};
-    for (const role of ROLES) {
-        orders[role] = decideForRole(role, weeks);
+
+    if (mode === 'glassbox' && weeks.length > 0) {
+        // GlassBox Strateegia
+        const retailerIncomingOrders = weeks.map(w => asInt(w.roles?.retailer?.incoming_orders));
+        const demandForecast = calculateEWMA(retailerIncomingOrders.slice(-PARAMS.FORECAST_WINDOW), PARAMS.FORECAST_LAMBDA);
+
+        for (const role of ROLES) {
+            orders[role] = decideForRole(role, weeks, demandForecast);
+        }
+    } else {
+        // BlackBox Strateegia
+        for (const role of ROLES) {
+            orders[role] = decideForRole(role, weeks);
+        }
     }
 
-    res.status(200).json({ orders });
+    return res.status(200).json({ orders });
 };
