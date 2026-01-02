@@ -1,45 +1,39 @@
 const STUDENT_EMAIL = "siveri@taltech.ee";
 const ALGO_NAME = "BullwhipSlayer";
-const VERSION = "v2.3.0";
+const VERSION = "v2.4.0";
 
 const PARAMS = {
     LEAD_TIME: 2,           // Tarneaeg lülide vahel (nädalates) on konstantne.
-    INITIAL_ORDER: 12,      // Algne tellimus, kui ajalugu puudub.
-    Kp: 0.30,               // Proportsionaalne võimendus (reageerib hetkeveale).
-    Ki: 0.22,               // Integraalne võimendus (korrigeerib pikaajalist, kumulatiivset viga).
-    INTEGRAL_CLAMP: 70,     // Anti-Windup: integraalviga ei saa minna üle +/- selle väärtuse. KÕIGE OLULISEM PARANDUS!
-    ORDER_SMOOTHING: 0.75,   // 40% uus arvutus + 60% eelmine tellimus. Summutab võnkumisi.
-    MAX_STEP_CHANGE: 30,    // Rate Limiting: tellimus ei saa muutuda nädalas rohkem kui see väärtus.
-    FORECAST_WINDOW: 10,     // Mitu viimast nädalat võtta prognoosi aluseks.
+    INITIAL_ORDER: 10,      // Algne tellimus, kui ajalugu puudub.
+    Kp: 0.21,               // Proportsionaalne võimendus (reageerib hetkeveale).
+    Ki: 0.16,               // Integraalne võimendus (korrigeerib pikaajalist, kumulatiivset viga).
+    Kd: 0.25,               // Derivatiivne: Ennetab ülereageerimist (pidur)
+    INTEGRAL_CLAMP: 60,     // Anti-Windup: integraalviga ei saa minna üle +/- selle väärtuse. KÕIGE OLULISEM PARANDUS!
+    ORDER_SMOOTHING: 0.65,   // 40% uus arvutus + 60% eelmine tellimus. Summutab võnkumisi.
+    MAX_STEP_CHANGE: 25,    // Rate Limiting: tellimus ei saa muutuda nädalas rohkem kui see väärtus.
+    FORECAST_WINDOW: 8,     // Mitu viimast nädalat võtta prognoosi aluseks.
     FORECAST_LAMBDA: 0.3,   // EWMA (eksponentsiaalse silumise) silumisfaktor.
-    SAFETY_STOCK_WEEKS: 1.2, // Mitu nädalat prognoositud nõudlust hoida puhverlaos.
+    SAFETY_STOCK_WEEKS: 1.5, // Mitu nädalat prognoositud nõudlust hoida puhverlaos.
 };
 
 const ROLES = ["retailer", "wholesaler", "distributor", "factory"];
 
-const asInt = (value) => {
-    const num = parseInt(value, 10);
-    return isNaN(num) ? 0 : num;
-};
+const asInt = (v) => parseInt(v, 10) || 0;
 
 // Exponentially Weighted Moving Average
 function calculateEWMA(values, lambda) {
     if (!values || values.length === 0) return PARAMS.INITIAL_ORDER;
-    let forecast = values.length > 0 ? values[0] : PARAMS.INITIAL_ORDER;
+    let forecast = values[0];
     for (let i = 1; i < values.length; i++) {
         forecast = lambda * values[i] + (1 - lambda) * forecast;
     }
     return Math.max(0, forecast);
 }
 
-/**
- * Arvutab otsuse ühele rollile, kasutades lõplikku, häälestatud regulaatorit.
- */
 function decideForRole(role, weeks, demandForecast) {
     const historyLength = weeks.length;
     if (historyLength === 0) return PARAMS.INITIAL_ORDER;
 
-    // Ajaloo eraldamine on selgem ja väldib korduvaid tsükleid.
     const history = weeks.map(w => ({
         demand: asInt(w.roles?.[role]?.incoming_orders),
         inventory: asInt(w.roles?.[role]?.inventory),
@@ -47,36 +41,34 @@ function decideForRole(role, weeks, demandForecast) {
         order: asInt(w.orders?.[role]),
     }));
 
-    const lastState = history[historyLength - 1];
-    const lastOrder = historyLength > 1 ? history[historyLength - 2].order : PARAMS.INITIAL_ORDER;
-
     const forecast = demandForecast !== undefined
         ? demandForecast
         : calculateEWMA(history.map(h => h.demand).slice(-PARAMS.FORECAST_WINDOW), PARAMS.FORECAST_LAMBDA);
 
-    // Täpsem "on-order" arvutus, mis vaatab ainult viimaseid tellimusi tarneaja sees.
-    const onOrder = history.slice(-PARAMS.LEAD_TIME).reduce((sum, h) => sum + h.order, 0);
+    // Arvutame vead ja integraali jooksvalt läbi ajaloo
+    let integralError = 0;
+    let currentError = 0;
+    let previousError = 0;
 
-    const inventoryPosition = lastState.inventory - lastState.backlog + onOrder;
-    const targetInvPos = forecast * (PARAMS.LEAD_TIME + PARAMS.SAFETY_STOCK_WEEKS);
+    for (let i = 0; i < historyLength; i++) {
+        const onOrder = history.slice(Math.max(0, i - PARAMS.LEAD_TIME), i).reduce((sum, h) => sum + h.order, 0);
+        const invPos = history[i].inventory - history[i].backlog + onOrder;
+        const targetInvPos = forecast * (PARAMS.LEAD_TIME + PARAMS.SAFETY_STOCK_WEEKS);
 
-    const currentError = targetInvPos - inventoryPosition;
+        previousError = currentError;
+        currentError = targetInvPos - invPos;
+        integralError += currentError;
+        integralError = Math.max(-PARAMS.INTEGRAL_CLAMP, Math.min(PARAMS.INTEGRAL_CLAMP, integralError));
+    }
 
-    // Integraalviga arvutatakse kogu ajaloost, kuid see on viimane samm, mitte tsükli sees.
-    const totalIntegralError = history.reduce((sum, h, i) => {
-        const pastOnOrder = history.slice(Math.max(0, i - PARAMS.LEAD_TIME), i).reduce((s, ho) => s + ho.order, 0);
-        const pastInvPos = h.inventory - h.backlog + pastOnOrder;
-        const pastTarget = forecast * (PARAMS.LEAD_TIME + PARAMS.SAFETY_STOCK_WEEKS); // lihtsustatud, kasutab viimast prognoosi
-        const pastError = pastTarget - pastInvPos;
-        return sum + pastError;
-    }, 0);
-
-    const integralError = Math.max(-PARAMS.INTEGRAL_CLAMP, Math.min(PARAMS.INTEGRAL_CLAMP, totalIntegralError));
-
+    // PID-komponendid
     const P = PARAMS.Kp * currentError;
     const I = PARAMS.Ki * integralError;
-    const rawOrder = forecast + P + I;
+    const D = PARAMS.Kd * (currentError - previousError); // PIDUR: reageerib vea muutumise kiirusele
 
+    const rawOrder = forecast + P + I + D;
+
+    const lastOrder = historyLength > 1 ? history[historyLength - 2].order : PARAMS.INITIAL_ORDER;
     const smoothedOrder = PARAMS.ORDER_SMOOTHING * rawOrder + (1 - PARAMS.ORDER_SMOOTHING) * lastOrder;
 
     const finalOrder = Math.max(
@@ -93,7 +85,6 @@ export default async function handler(req, res) {
     }
     const body = req.body || {};
 
-    // Handshake
     if (body.handshake === true) {
         return res.status(200).json({
             ok: true,
@@ -103,8 +94,8 @@ export default async function handler(req, res) {
             supports: { blackbox: true, glassbox: true },
             message: "BeerBot ready",
             uses_llm: false,
-            llm_description: "A finely-tuned, responsive PI controller. Parameters are balanced for aggressive backlog clearing and minimal inventory overshoot, targeting top-tier performance.",
-            student_comment: "Final version: Increased controller gains and relaxed stabilizers for a faster, more adaptive response to demand changes, aiming to minimize total cost across the entire simulation.",
+            llm_description: "A complete Proportional-Integral-Derivative (PID) controller. The derivative term acts as a predictive brake to prevent overshoot, ensuring a fast yet stable response to demand changes.",
+            student_comment: "This final version uses a full PID implementation to achieve optimal control, balancing rapid backlog correction with proactive inventory management to minimize total system cost.",
         });
     }
 
